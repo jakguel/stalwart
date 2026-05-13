@@ -60,12 +60,17 @@ async fn insert_safe_defaults(bp: &mut Bootstrap) -> trc::Result<()> {
                     auto_update_frequency: Duration::from_millis(30 * 24 * 60 * 60 * 1000),
                     description: "Stalwart Web Interface".to_string(),
                     enabled: true,
-                    #[cfg(not(feature = "dev_mode"))]
-                    resource_url:
-                        "https://github.com/stalwartlabs/webui/releases/latest/download/webui.zip"
-                            .into(),
-                    #[cfg(feature = "dev_mode")]
-                    resource_url: "file:///Users/me/code/webui/.ignore/webui.zip".into(),
+                    resource_url: std::env::var("STALWART_WEBUI_URL")
+                        .unwrap_or_else(|_| {
+                            #[cfg(not(feature = "dev_mode"))]
+                            {
+                                "https://github.com/stalwartlabs/webui/releases/latest/download/webui.zip".to_string()
+                            }
+                            #[cfg(feature = "dev_mode")]
+                            {
+                                "file:///Users/me/code/webui/.ignore/webui.zip".to_string()
+                            }
+                        }),
                     unpack_directory: None,
                     url_prefix: Map::new(vec!["/admin".into(), "/account".into()]),
                 }

@@ -1,0 +1,92 @@
+# Dockerfile.webui — Stalwart with embedded WebUI (no runtime GitHub download)
+#
+# This Dockerfile builds the stalwart binary and downloads the WebUI zip from
+# GitHub Releases at BUILD time, embedding it in the final image. The container
+# does not need to download the WebUI from GitHub at startup.
+#
+# Usage:
+#   # Build with latest WebUI release:
+#   docker build -f Dockerfile.webui -t stalwart-webui .
+#
+#   # Build with a specific WebUI version:
+#   docker build -f Dockerfile.webui --build-arg WEBUI_VERSION=v1.0.4 -t stalwart-webui .
+#
+# The container automatically configures stalwart to use the embedded WebUI
+# via the STALWART_WEBUI_URL environment variable. No manual configuration
+# needed — the admin UI works out of the box on first start.
+#
+# The embedded zip is located at /usr/local/share/stalwart/webui.zip inside
+# the container. To override, set STALWART_WEBUI_URL to any http(s):// or
+# file:// URL.
+
+# =============================================================================
+# WebUI download stage
+# =============================================================================
+FROM docker.io/debian:trixie-slim AS webui
+ARG WEBUI_VERSION=latest
+RUN apt-get update && \
+    apt-get install -yq --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    if [ "${WEBUI_VERSION}" = "latest" ]; then \
+        WEBUI_URL="https://github.com/stalwartlabs/webui/releases/latest/download/webui.zip"; \
+    else \
+        WEBUI_URL="https://github.com/stalwartlabs/webui/releases/download/${WEBUI_VERSION}/webui.zip"; \
+    fi; \
+    echo "Downloading WebUI from ${WEBUI_URL}"; \
+    curl --retry 5 -fLo /webui.zip "${WEBUI_URL}"
+
+# =============================================================================
+# Rust build stages (same as Dockerfile)
+# =============================================================================
+FROM --platform=$BUILDPLATFORM docker.io/lukemathwalker/cargo-chef:latest-rust-slim-trixie AS chef
+WORKDIR /build
+
+FROM --platform=$BUILDPLATFORM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path /recipe.json
+
+FROM --platform=$BUILDPLATFORM chef AS builder
+ARG TARGETPLATFORM
+RUN case "${TARGETPLATFORM}" in \
+    "linux/arm64") echo "aarch64-unknown-linux-gnu" > /target.txt && echo "-C linker=aarch64-linux-gnu-gcc" > /flags.txt ;; \
+    "linux/amd64") echo "x86_64-unknown-linux-gnu" > /target.txt && echo "-C linker=x86_64-linux-gnu-gcc" > /flags.txt ;; \
+    *) exit 1 ;; \
+    esac
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get install -yq --no-install-recommends build-essential libclang-19-dev \
+    g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+    g++-x86-64-linux-gnu binutils-x86-64-linux-gnu
+RUN rustup target add "$(cat /target.txt)"
+COPY --from=planner /recipe.json /recipe.json
+RUN RUSTFLAGS="$(cat /flags.txt)" cargo chef cook --target "$(cat /target.txt)" --release --no-default-features --features "sqlite postgres mysql rocks s3 redis azure nats enterprise" --recipe-path /recipe.json
+COPY . .
+RUN RUSTFLAGS="$(cat /flags.txt)" cargo build --target "$(cat /target.txt)" --release -p stalwart --no-default-features --features "sqlite postgres mysql rocks s3 redis azure nats enterprise"
+RUN mv "/build/target/$(cat /target.txt)/release" "/output"
+
+# =============================================================================
+# Final runtime image
+# =============================================================================
+FROM docker.io/debian:trixie-slim
+RUN export DEBIAN_FRONTEND=noninteractive && \
+    apt-get update && \
+    apt-get install -yq --no-install-recommends ca-certificates curl libcap2-bin && \
+    rm -rf /var/lib/apt/lists/* && \
+    groupadd -r -g 2000 stalwart && \
+    useradd -r -u 2000 -g 2000 -s /usr/sbin/nologin -M stalwart && \
+    mkdir -p /etc/stalwart /var/lib/stalwart /usr/local/share/stalwart && \
+    chown stalwart:stalwart /etc/stalwart /var/lib/stalwart
+COPY --from=builder --chmod=0755 /output/stalwart /usr/local/bin/stalwart
+COPY --from=webui --chmod=0644 /webui.zip /usr/local/share/stalwart/webui.zip
+RUN setcap 'cap_net_bind_service=+ep' /usr/local/bin/stalwart
+ENV STALWART_WEBUI_URL=file:///usr/local/share/stalwart/webui.zip
+USER stalwart
+WORKDIR /var/lib/stalwart
+VOLUME ["/etc/stalwart", "/var/lib/stalwart"]
+EXPOSE	443 25 110 587 465 143 993 995 4190 8080
+ENV STALWART_HEALTHCHECK_URL=https://127.0.0.1:443/healthz/live
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsSk -H "X-Forwarded-For: 127.0.0.1" "$STALWART_HEALTHCHECK_URL" || curl -fsS -H "X-Forwarded-For: 127.0.0.1" http://127.0.0.1:8080/healthz/live || exit 1
+ENTRYPOINT ["/usr/local/bin/stalwart"]
+CMD ["--config", "/etc/stalwart/config.json"]
